@@ -1,18 +1,30 @@
 package main
 
 import (
+	"bufio"
+	"strings"
 	"crypto/x509/pkix"
 	"flag"
+	"fmt"
 	log "github.com/sirupsen/logrus"
 	"github.com/tomcat-bit/ifritcert"
 	"os"
 )
 
 var DefaultPermission = os.FileMode(0750)
+var deploymentFilePath = "deployment_files"
 
 type App struct {
 	ca          *ifritcert.Ca
 	cryptoUnits []*ifritcert.CryptoUnit
+}
+
+type Build struct {
+	hostname string
+}
+
+type Deployment struct {
+	hostname string
 }
 
 func main() {
@@ -23,24 +35,20 @@ func main() {
 	var load bool
 	var caDirectory string
 	var outputDirectory string
+	var hostnameFile string
+	var hostnames []string
+	var genDeploymentSchema bool
 
 	flag.BoolVar(&load, "load", false, "If true, create a new CA and cryptographic resources. Otherwise, use existing resources.")
 	flag.IntVar(&tcpPort, "tcp", 0, "TCP port of the Ifrit client's X.509 certificate.")
 	flag.IntVar(&udpPort, "udp", 0, "UDP port of the Ifrit client's X.509 certificate.")
 	flag.IntVar(&numRings, "rings", 10, "Number of rings in the Ifrit network.")
 	flag.IntVar(&bootNodes, "nodes", 10, "Number of boot nodes in the Ifrit network.")
+	flag.StringVar(&hostnameFile, "f", "", "Line-separated file of hostnames. If this flag is set, it will ignore the positional arguments.")
 	flag.StringVar(&outputDirectory, "o", ".", "Directory into which certificates and keys are stored.")
+	flag.BoolVar(&genDeploymentSchema, "build", false, "If true, generate YAML schemas for each Azure Container Instance.")
 	flag.Parse()
 	args := flag.Args()
-
-	if len(args) == 0 {
-		log.Println("Missing arguments")
-		log.Println("Usage: ifrit-ca-gen.go [OPTIONS...] CRYPTO-DIR HOSTNAME [HOSTNAME...]")
-		flag.PrintDefaults()
-		os.Exit(1)
-	}
-
-	caDirectory = args[0]
 
 	if load {
 		// Require CA's directory
@@ -54,16 +62,25 @@ func main() {
 		}
 	}
 
-	// Find all hostnames to generate certs and keys from
-	if len(args) == 1 {
-		log.Println("No hostname was found")
-		log.Println("Usage: ifrit-ca-gen.go [OPTIONS...] CRYPTO-DIR HOSTNAME [HOSTNAME...]")
-		flag.PrintDefaults()
-		os.Exit(1)
+	// Don't use hostname file
+	if hostnameFile == "" {
+		if len(args) == 1 {
+			log.Println("No hostname was found")
+			log.Println("Usage: ifrit-ca-gen [OPTIONS...] CRYPTO-DIR HOSTNAME [HOSTNAME...]")
+			flag.PrintDefaults()
+			os.Exit(1)
+		}
+		hostnames = args[0:]
+	} else {
+		h, err := readHostnameFile(hostnameFile)
+		if err != nil {
+			log.Fatal(err.Error())
+		}
+		hostnames = h
 	}
 
 	if caDirectory == "" {
-		log.Info("CRYPTO-DIR not set. Using default 'ca_dir'.")
+		log.Info("CRYPTO-DIR not set. Using default 'ca_dir' instead.")
 		caDirectory = "ca_dir"
 	}
 
@@ -73,7 +90,7 @@ func main() {
 		log.Fatal(err.Error())
 	}
 
-	cuConfigs := createCryptoUnitConfigs(outputDirectory, args[1:])
+	cuConfigs := createCryptoUnitConfigs(outputDirectory, hostnames, tcpPort, udpPort)
 	if err = createCryptoUnits(cuConfigs, ca); err != nil {
 		log.Fatal(err.Error())
 	}
@@ -86,15 +103,76 @@ func main() {
 	if err := ca.SaveCertificate(); err != nil {
 		log.Fatal(err.Error())
 	}
+
+	if genDeploymentSchema {
+		if err := generateDeploymentSchema(deploymentFilePath, hostnames); err != nil {
+			log.Fatal(err.Error())
+		}
+	}
+
+	os.Exit(0)
 }
 
-func createCryptoUnitConfigs(outputDirectory string, hostnames []string) []*ifritcert.CryptoUnitConfig {
+func generateDeploymentSchema(outputDirectory string, hostnames []string) error {
+	if _, err := os.Stat(outputDirectory); os.IsNotExist(err) {
+		if err := os.Mkdir(outputDirectory, 0755); err != nil {
+			return err
+		}
+	}
+
+	for _, h := range hostnames {
+		location := strings.Split(h, ".")[1]
+		tag := strings.Split(h, ".")[0]
+		fileContent := deploymentFile(location, tag)
+
+		log.Println("location:", location)
+
+		filename := fmt.Sprintf("%s/%s.yaml", outputDirectory, h)
+		f, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+    	if err != nil {
+	        return err
+	    }
+
+		if _, err := f.Write([]byte(fileContent)); err != nil {
+			f.Close() 
+			return err
+		}
+
+    	if err := f.Close(); err != nil {
+	        return err
+	    }
+	}
+	return nil 
+}
+
+func readHostnameFile(filepath string) ([]string, error) {
+	hostnames := make([]string, 0)
+	file, err := os.Open(filepath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		hostnames = append(hostnames, scanner.Text())
+	}
+
+	return hostnames, scanner.Err()
+}
+
+func createCryptoUnitConfigs(outputDirectory string, hostnames []string, tcpPort int, udpPort int) []*ifritcert.CryptoUnitConfig {
 	configs := make([]*ifritcert.CryptoUnitConfig, 0)
 	for _, h := range hostnames {
-		c := &ifritcert.CryptoUnitConfig{
-			Identity: pkix.Name{
-				CommonName: h,
+		pk := pkix.Name{
+			Locality: []string{
+				fmt.Sprintf("%s:%d", h, tcpPort),
+				fmt.Sprintf("%s:%d", h, udpPort),
 			},
+		}
+
+		c := &ifritcert.CryptoUnitConfig{
+			Identity: pk,
 			DNSNames: []string{h},
 			Path:     outputDirectory + "/" + h,
 		}
@@ -166,3 +244,74 @@ func createCa(load bool, caDirectory string, numRings int, bootNodes int) (*ifri
 	}
 	return ca, nil
 }
+
+func deploymentFile(location string, tag string) string {
+	return fmt.Sprintf(`
+location: %s
+name: %s
+properties:
+  containers:
+  - name: %s
+    properties:
+      image: lohpi.azurecr.io/%s:latest
+      resources:
+        requests:
+          cpu: 2
+          memoryInGb: 1.5
+      ports:
+        - protocol: UDP
+          port: 8000
+        - protocol: TCP
+          port: 5000
+  osType: Linux
+  ipAddress:
+    type: Public
+    ports:
+      - protocol: UDP
+        port: 8000
+      - protocol: TCP
+        port: 5000
+    dnsnamelabel: %s
+  imageRegistryCredentials:
+    - server: lohpi.azurecr.io
+      username: lohpi
+      password: jQA8j+27P11I36IOJGf9lXWwKqqbo/Ym
+tags: {exampleTag: tutorial}
+type: Microsoft.ContainerInstance/containerGroups
+`, location, tag, tag, tag, tag)
+}
+
+/*
+location: norwayeast
+name: ifrit-server
+properties:
+  containers:
+  - name: ifrit-server
+    properties:
+      image: lohpi.azurecr.io/ifrit-server:latest
+      resources:
+        requests:
+          cpu: 2
+          memoryInGb: 1.5
+      ports:
+        - protocol: UDP
+          port: 8000
+        - protocol: TCP
+          port: 5000
+  osType: Linux
+  ipAddress:
+    type: Public
+    ports:
+      - protocol: UDP
+        port: 8000
+      - protocol: TCP
+        port: 5000
+    dnsnamelabel: "ifrit-server"
+  imageRegistryCredentials:
+    - server: lohpi.azurecr.io
+      username: lohpi
+      password: jQA8j+27P11I36IOJGf9lXWwKqqbo/Ym
+tags: {exampleTag: tutorial}
+type: Microsoft.ContainerInstance/containerGroups
+
+*/

@@ -369,7 +369,7 @@ func (c *Ca) GetCertificateSet(req []byte) ([]byte, error) {
 
 	g := c.groups[0]
 
-	log.Info("Generating a new certificate set for hostnames", reqCert.DNSNames)
+	log.Infof("Generating a new certificate set for hostnames %s ...", reqCert.DNSNames)
 
 	//No idea what this is
 	//var oidExtensionBasicConstraints = []int{2, 5, 29, 19}
@@ -417,8 +417,6 @@ func (c *Ca) GetCertificateSet(req []byte) ([]byte, error) {
 	}
 	trusted := g.addKnownCert(knownCert)
 
-	log.Println("getTrustedNodes:", len(g.getTrustedNodes()))
-
 	resp := certResponse{
 		OwnCert:    signedCert,
 		KnownCerts: g.getTrustedNodes(),
@@ -426,7 +424,7 @@ func (c *Ca) GetCertificateSet(req []byte) ([]byte, error) {
 		Trusted:    trusted,
 	}
 
-	log.Infof("Including %d known certificates in response to ", len(resp.KnownCerts))
+	log.Infof("Including %d known certificates in response to %s ...", len(resp.KnownCerts), reqCert.DNSNames)
 
 	b := new(bytes.Buffer)
 	if err := json.NewEncoder(b).Encode(resp); err != nil {

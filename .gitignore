@@ -1,0 +1,4 @@
+*.pem
+ca_dir/
+deployment_files/
+hostnames
